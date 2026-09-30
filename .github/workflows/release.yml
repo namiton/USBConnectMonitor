@@ -34,7 +34,8 @@ jobs:
           "SHA256=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Publish release
-        shell: powershell
+        # Windows PowerShell 5.1 は BOM なしスクリプトを ANSI として読み、日本語のノートが文字化けするため pwsh を使う
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
