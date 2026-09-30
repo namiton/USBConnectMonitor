@@ -1,0 +1,6 @@
+# Build output (UsbMonitor/build.ps1)
+UsbMonitor/bin/
+
+# Runtime logs / reports (contain local device IDs and serials)
+reports/
+*.log
