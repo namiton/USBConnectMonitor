@@ -13,11 +13,20 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
+
+[assembly: AssemblyTitle("USB Monitor")]
+[assembly: AssemblyProduct("USB Connect Monitor")]
+[assembly: AssemblyCopyright("Copyright (c) 2026 @Namiton")]
+[assembly: AssemblyVersion("1.0.1.0")]
+[assembly: AssemblyFileVersion("1.0.1.0")]
+// P/Invoke の DLL は System32 からだけ読み込む（exe と同じフォルダに置かれた偽 DLL を読まない）
+[assembly: DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
 
 namespace UsbMonitor
 {
@@ -137,8 +146,18 @@ namespace UsbMonitor
         [DllImport("cfgmgr32.dll")] static extern int CM_Get_DevNode_Status(out int status, out int problem, int devInst, int flags);
         [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)] static extern int CM_Get_DevNode_PropertyW(int devInst, ref DEVPROPKEY key, out uint type, byte[] buf, ref int size, int flags);
         [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetDefaultDllDirectories(uint flags);
+
+        const uint LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x800;
+
+        // 以降にプロセス内で読み込まれる DLL の検索先を System32 に限定する（DLL プランティング対策）
+        public static void RestrictDllSearchToSystem32()
+        {
+            try { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32); } catch { }
+        }
 
         const int CR_SUCCESS = 0;
+        const int CR_BUFFER_SMALL = 0x1A;
         const int CM_GETIDLIST_FILTER_ENUMERATOR = 0x1;
         const int CM_GETIDLIST_FILTER_PRESENT = 0x100;
         const int CM_LOCATE_DEVNODE_PHANTOM = 0x1;
@@ -149,17 +168,22 @@ namespace UsbMonitor
         static DEVPROPKEY KeyLocationInfo = new DEVPROPKEY("a45c254e-df1c-4efd-8020-67d146a850e0", 15);
         static DEVPROPKEY KeyBusReportedDesc = new DEVPROPKEY("540b947e-8b40-45bc-a8a2-6a0b894cbda2", 4);
 
-        // 現在接続中（devnode が存在する）の USB デバイス ID 一覧
+        // 現在接続中（devnode が存在する）の USB デバイス ID 一覧。取得できなかったときは null
         public static List<string> GetPresentUsbIds()
         {
-            var list = new List<string>();
             int flags = CM_GETIDLIST_FILTER_ENUMERATOR | CM_GETIDLIST_FILTER_PRESENT;
-            int len;
-            if (CM_Get_Device_ID_List_SizeW(out len, "USB", flags) != CR_SUCCESS || len <= 0) return list;
-            var buf = new char[len];
-            if (CM_Get_Device_ID_ListW("USB", buf, len, flags) != CR_SUCCESS) return list;
-            foreach (var s in new string(buf).Split(new[] { '\0' }, StringSplitOptions.RemoveEmptyEntries)) list.Add(s);
-            return list;
+            // サイズ取得と一覧取得の間に機器が抜き差しされると CR_BUFFER_SMALL になるので取り直す
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                int len;
+                if (CM_Get_Device_ID_List_SizeW(out len, "USB", flags) != CR_SUCCESS || len <= 0) return null;
+                var buf = new char[len + 256];
+                int cr = CM_Get_Device_ID_ListW("USB", buf, buf.Length, flags);
+                if (cr == CR_BUFFER_SMALL) continue;
+                if (cr != CR_SUCCESS) return null;
+                return new List<string>(new string(buf).Split(new[] { '\0' }, StringSplitOptions.RemoveEmptyEntries));
+            }
+            return null;
         }
 
         // 問題コード（0 = 正常, -1 = devnode なし）
@@ -191,8 +215,17 @@ namespace UsbMonitor
             if (size <= 0) return null;
             var buf = new byte[size];
             if (CM_Get_DevNode_PropertyW(dev, ref key, out type, buf, ref size, 0) != CR_SUCCESS) return null;
-            var s = Encoding.Unicode.GetString(buf, 0, size).TrimEnd('\0');
+            var s = Sanitize(Encoding.Unicode.GetString(buf, 0, size));
             return s.Length == 0 ? null : s;
+        }
+
+        // デバイス名は USB 機器自身が申告する文字列なので、制御文字（改行・タブ・ESC など）を除いて扱う
+        public static string Sanitize(string s)
+        {
+            if (s == null) return null;
+            var sb = new StringBuilder(s.Length);
+            foreach (char c in s) if (!char.IsControl(c)) sb.Append(c);
+            return sb.ToString().Trim();
         }
 
         public static void DarkTitleBar(IntPtr hwnd)
@@ -425,7 +458,7 @@ namespace UsbMonitor
         List<Device> sortedDevices = new List<Device>();
         List<MonitorEvent> visibleEvents = new List<MonitorEvent>();
         string selectedId;
-        bool firstScan = true, paused, watcherActive;
+        bool firstScan = true, paused, watcherActive, closing;
         DateTime startTime = DateTime.Now;
         int sessionTotal;
         MonitorEvent lastDisconnect;
@@ -480,7 +513,7 @@ namespace UsbMonitor
 
             pauseButton.Click += (s, e) => TogglePause();
             clearButton.Click += (s, e) => ClearSession();
-            logButton.Click += (s, e) => { Directory.CreateDirectory(logDir); Process.Start("explorer.exe", "\"" + logDir + "\""); };
+            logButton.Click += (s, e) => OpenLogFolder();
 
             Controls.AddRange(new Control[] { deviceList, eventList, pauseButton, clearButton, logButton });
 
@@ -500,16 +533,44 @@ namespace UsbMonitor
             ThreadPool.QueueUserWorkItem(_ => LoadRecentHistory());
         }
 
-        protected override void OnFormClosed(FormClosedEventArgs e)
+        protected override void OnFormClosing(FormClosingEventArgs e)
         {
+            closing = true;
             timer.Stop();
-            if (watcher != null) { watcher.Enabled = false; watcher.Dispose(); }
-            base.OnFormClosed(e);
+            if (watcher != null) { try { watcher.Enabled = false; watcher.Dispose(); } catch { } }
+            base.OnFormClosing(e);
+        }
+
+        // 別スレッドから UI を更新する。終了中・破棄後は何もしない（終了時の例外で落ちないように）
+        void PostToUi(Action action)
+        {
+            if (closing || IsDisposed || !IsHandleCreated) return;
+            try { BeginInvoke(action); }
+            catch (InvalidOperationException) { }   // ObjectDisposedException もここで捕まる
+        }
+
+        void OpenLogFolder()
+        {
+            try
+            {
+                Directory.CreateDirectory(logDir);
+                Process.Start("explorer.exe", "\"" + logDir + "\"");
+            }
+            catch (Exception ex)
+            {
+                AddEvent(EventKind.Warn, null, "ログフォルダを開けません", ex.Message);
+                RefreshViews();
+            }
         }
 
         protected override void OnKeyDown(KeyEventArgs e)
         {
-            if (e.Control && e.KeyCode == Keys.C && selectedId != null) { Clipboard.SetText(selectedId); e.Handled = true; }
+            if (e.Control && e.KeyCode == Keys.C && selectedId != null)
+            {
+                // 他のアプリがクリップボードを掴んでいると例外になるため握って無視する
+                try { Clipboard.SetText(selectedId); } catch (ExternalException) { }
+                e.Handled = true;
+            }
             if (e.KeyCode == Keys.Escape && selectedId != null) { SelectDevice(null); e.Handled = true; }
             base.OnKeyDown(e);
         }
@@ -698,14 +759,22 @@ namespace UsbMonitor
                 watcher = new EventLogWatcher(q);
                 watcher.EventRecordWritten += (s, e) =>
                 {
-                    var rec = e.EventRecord;
-                    if (rec == null || rec.Properties.Count == 0) return;
-                    string id = rec.Properties[0].Value as string;
-                    DateTime t = rec.TimeCreated ?? DateTime.Now;
-                    int eid = rec.Id;
-                    long recId = rec.RecordId ?? -1;
-                    if (id == null || !IsTarget(id) || !IsHandleCreated) return;
-                    BeginInvoke(new Action(() => OnDisconnect(id, t, eid == 1011 ? "デバイスが障害を報告" : "バス上から消えた", recId)));
+                    if (e.EventRecord == null) return;
+                    string id; DateTime t; int eid; long recId;
+                    try
+                    {
+                        using (var rec = e.EventRecord)
+                        {
+                            if (rec.Properties.Count == 0) return;
+                            id = rec.Properties[0].Value as string;
+                            t = rec.TimeCreated ?? DateTime.Now;
+                            eid = rec.Id;
+                            recId = rec.RecordId ?? -1;
+                        }
+                    }
+                    catch { return; }
+                    if (id == null || !IsTarget(id)) return;
+                    PostToUi(() => OnDisconnect(id, t, eid == 1011 ? "デバイスが障害を報告" : "バス上から消えた", recId));
                 };
                 watcher.Enabled = true;
                 watcherActive = true;
@@ -739,8 +808,7 @@ namespace UsbMonitor
                 }
             }
             catch { return; }
-            if (!IsHandleCreated) return;
-            BeginInvoke(new Action(() =>
+            PostToUi(() =>
             {
                 foreach (var f in found)
                 {
@@ -749,7 +817,7 @@ namespace UsbMonitor
                     d.Recent.Add(f.Item2);
                 }
                 RefreshViews();
-            }));
+            });
         }
 
         void OnDisconnect(string id, DateTime time, string reason, long recordId)
@@ -769,7 +837,10 @@ namespace UsbMonitor
         void Scan()
         {
             if (paused) return;
-            var present = new HashSet<string>(Native.GetPresentUsbIds().Where(IsTarget), StringComparer.OrdinalIgnoreCase);
+            var ids = Native.GetPresentUsbIds();
+            // 一覧を取れなかった回は判定しない（空とみなすと全デバイスが切断→接続扱いになる）
+            if (ids == null) return;
+            var present = new HashSet<string>(ids.Where(IsTarget), StringComparer.OrdinalIgnoreCase);
             foreach (var id in present)
             {
                 Device known;
@@ -828,7 +899,9 @@ namespace UsbMonitor
             {
                 Directory.CreateDirectory(logDir);
                 string kind = ev.Kind == EventKind.Disconnect ? "切断" : ev.Kind == EventKind.Connect ? "接続" : ev.Kind == EventKind.Error ? "異常" : ev.Kind == EventKind.Warn ? "注意" : "情報";
-                string line = string.Join("\t", ev.Time.ToString("yyyy-MM-dd HH:mm:ss.fff"), kind, ev.Name, ev.DeviceId ?? "", ev.Detail ?? "");
+                // 各項目の改行・タブを除き、1 イベント = 1 行を保つ（ログ行の偽装を防ぐ）
+                string line = string.Join("\t", ev.Time.ToString("yyyy-MM-dd HH:mm:ss.fff"), kind,
+                    Native.Sanitize(ev.Name), Native.Sanitize(ev.DeviceId ?? ""), Native.Sanitize(ev.Detail ?? ""));
                 File.AppendAllText(Path.Combine(logDir, "usbmonitor_" + ev.Time.ToString("yyyyMMdd") + ".log"), line + Environment.NewLine, Encoding.UTF8);
             }
             catch { }
@@ -891,6 +964,7 @@ namespace UsbMonitor
         [STAThread]
         static void Main()
         {
+            Native.RestrictDllSearchToSystem32();
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             using (var g = Graphics.FromHwnd(IntPtr.Zero)) Theme.Scale = g.DpiX / 96f;

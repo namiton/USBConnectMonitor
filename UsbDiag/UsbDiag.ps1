@@ -29,9 +29,22 @@ $ErrorActionPreference = 'Stop'
 if (-not $ReportDir) { $ReportDir = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'reports' }
 
 # ---------------------------------------------------------------- 出力ヘルパー
+# デバイス名は USB 機器自身が申告する文字列。ESC などの制御文字でターミナル表示を
+# 書き換えられないよう、画面・ファイルに出す前に制御文字を取り除く
+function Protect-Text([string]$Text) {
+    if ($null -eq $Text) { return $null }
+    ($Text -replace '[\p{Cc}]', '').Trim()
+}
+# CSV を Excel で開いたとき数式として実行されないよう、= + - @ で始まるセルを文字列扱いにする
+function Protect-CsvCell([string]$Text) {
+    $t = Protect-Text $Text
+    if ($t -match '^[=+\-@]') { "'" + $t } else { $t }
+}
+
 $script:ReportLines = New-Object System.Collections.Generic.List[string]
 function Out-Line {
     param([string]$Text = '', [string]$Color = 'Gray')
+    $Text = ($Text -replace '[\p{Cc}]', '')
     Write-Host $Text -ForegroundColor $Color
     $script:ReportLines.Add($Text)
 }
@@ -54,20 +67,20 @@ function Get-DevInfo([string]$InstanceId) {
     $parent = Get-DevProp $InstanceId 'DEVPKEY_Device_Parent'
     $info = [pscustomobject]@{
         InstanceId = $InstanceId
-        Name       = if ($busDesc) { $busDesc } elseif ($dev) { $dev.FriendlyName } else { '(不明なデバイス)' }
+        Name       = Protect-Text $(if ($busDesc) { $busDesc } elseif ($dev) { $dev.FriendlyName } else { '(不明なデバイス)' })
         Class      = if ($dev) { $dev.Class } else { '' }
         Present    = [bool]($dev -and $dev.Present)
         Status     = if ($dev) { $dev.Status } else { '' }
         Location   = Get-DevProp $InstanceId 'DEVPKEY_Device_LocationInfo'
         Parent     = $parent
-        ParentName = if ($parent) { (Get-PnpDevice -InstanceId $parent -ErrorAction SilentlyContinue).FriendlyName } else { $null }
+        ParentName = if ($parent) { Protect-Text (Get-PnpDevice -InstanceId $parent -ErrorAction SilentlyContinue).FriendlyName } else { $null }
         Controller = $null
     }
     # 親をたどって USB ホストコントローラーを特定
     $p = $parent
     for ($i = 0; $p -and $i -lt 8; $i++) {
         if ($p -notlike 'USB\*') {
-            $info.Controller = (Get-PnpDevice -InstanceId $p -ErrorAction SilentlyContinue).FriendlyName
+            $info.Controller = Protect-Text (Get-PnpDevice -InstanceId $p -ErrorAction SilentlyContinue).FriendlyName
             break
         }
         $p = Get-DevProp $p 'DEVPKEY_Device_Parent'
@@ -99,7 +112,7 @@ function Start-Watch {
         $map
     }
     function Write-WatchLine([string]$Text, [string]$Color, [datetime]$At = (Get-Date)) {
-        $line = '{0}  {1}' -f $At.ToString('HH:mm:ss.fff'), $Text
+        $line = '{0}  {1}' -f $At.ToString('HH:mm:ss.fff'), (Protect-Text $Text)
         Write-Host $line -ForegroundColor $Color
         Add-Content -Path $logPath -Value $line -Encoding UTF8
     }
@@ -332,7 +345,7 @@ foreach ($g in $groups) {
             ForEach-Object { (Get-DevInfo $_.Name).Name }) -join ' / '
         Add-Hyp '高' 'デバイス単体ではなく、ハブ・コントローラ・給電など上流側の問題' `
             ("切断の {0:P0} で他デバイスも同時に切断（一緒に切れる機器: {1}）" -f $simulRatio, $coNames) `
-            @('同時に切れる機器が共通のハブ/フロントパネルにつながっていないか確認し、別系統のポートに分ける', 'USB ハブを外して PC に直結する', '消費電力の大きい機器（HDD・Web カメラ等）を外して再現するか見る', 'マザーボードのチップセット/USB ドライバーと BIOS を更新する')
+            @('同時に切れる機器が共通のハブ/フロントパネルにつながっていないか確認し、別系統のポートに分ける', 'USB ハブを外して PC に直結する', '消費電力の大きい機器（HDD・Web カメラ等）を外して再現するか見る', 'マザーボードのチップセット/USB ドライバーを更新する', '（上記で改善しない場合）BIOS/UEFI の更新も検討する。更新中の電源断や中断は PC が起動しなくなる原因になるため、必ずメーカーの手順に従い、ノート PC は AC 電源につないで行う')
     }
     else {
         Add-Hyp '高' 'このデバイス（またはそのケーブル・挿しているポート）単体の問題' `
@@ -401,13 +414,22 @@ Out-Line '  2. 対策後、  UsbDiag.bat -Watch  で監視しながら普段ど�
 Out-Line '  3. 数日後に再度このレポートを出し、日別の切断回数が減ったかで効果を判断する'
 
 # ---------------------------------------------------------------- 保存
-if (-not (Test-Path $ReportDir)) { New-Item -ItemType Directory -Path $ReportDir | Out-Null }
-$reportPath = Join-Path $ReportDir ('report_{0}.txt' -f $reportTime.ToString('yyyyMMdd_HHmmss'))
-$script:ReportLines | Set-Content -Path $reportPath -Encoding UTF8
-$csvPath = [IO.Path]::ChangeExtension($reportPath, '.csv')
-$removals | Sort-Object Time | Select-Object @{n = 'Time'; e = { $_.Time.ToString('yyyy-MM-dd HH:mm:ss') } }, Kind, InstanceId,
-    @{n = 'Name'; e = { (Get-DevInfo $_.InstanceId).Name } }, NearPower |
-    Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
-Write-Host ''
-Write-Host "レポート保存: $reportPath" -ForegroundColor DarkGray
-Write-Host "切断イベント一覧(CSV): $csvPath" -ForegroundColor DarkGray
+try {
+    if (-not (Test-Path $ReportDir)) { New-Item -ItemType Directory -Path $ReportDir | Out-Null }
+    $reportPath = Join-Path $ReportDir ('report_{0}.txt' -f $reportTime.ToString('yyyyMMdd_HHmmss'))
+    $script:ReportLines | Set-Content -Path $reportPath -Encoding UTF8
+    $csvPath = [IO.Path]::ChangeExtension($reportPath, '.csv')
+    $removals | Sort-Object Time | Select-Object @{n = 'Time'; e = { $_.Time.ToString('yyyy-MM-dd HH:mm:ss') } }, Kind,
+        @{n = 'InstanceId'; e = { Protect-CsvCell $_.InstanceId } },
+        @{n = 'Name'; e = { Protect-CsvCell (Get-DevInfo $_.InstanceId).Name } }, NearPower |
+        Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+    Write-Host ''
+    Write-Host "レポート保存: $reportPath" -ForegroundColor DarkGray
+    Write-Host "切断イベント一覧(CSV): $csvPath" -ForegroundColor DarkGray
+    Write-Host '※ レポートと CSV には接続機器のシリアル番号が含まれます。人に共有するときは注意してください' -ForegroundColor DarkGray
+}
+catch {
+    Write-Host ''
+    Write-Host "レポートを保存できませんでした（$ReportDir）: $($_.Exception.Message)" -ForegroundColor Yellow
+    Write-Host '書き込みできるフォルダに置くか、-ReportDir で保存先を指定してください' -ForegroundColor Yellow
+}

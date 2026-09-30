@@ -1,0 +1,52 @@
+# Copyright (c) 2026 @Namiton
+# SPDX-License-Identifier: MIT
+#
+# v* タグの push で UsbMonitor.exe をビルドし、SHA256 と一緒に GitHub Release に公開する。
+# 配布 exe がこのリポジトリのソースから CI でビルドされたことを誰でも確認できるようにする。
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build
+        shell: powershell
+        run: ./UsbMonitor/build.ps1
+
+      - name: Checksum
+        shell: powershell
+        run: |
+          $exe = 'UsbMonitor/bin/UsbMonitor.exe'
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  UsbMonitor.exe" | Out-File -FilePath 'UsbMonitor/bin/UsbMonitor.exe.sha256' -Encoding ascii
+          "SHA256=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Publish release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          $notes = @"
+          ## ダウンロード
+          ``UsbMonitor.exe`` をダウンロードしてそのまま起動できます（管理者権限・インストール不要 / Windows 10・11 + .NET Framework 4.x）。
+          診断スクリプト UsbDiag はソースコード（zip）に含まれています。
+
+          ## SHA256
+          ``$env:SHA256``
+
+          この exe は GitHub Actions がタグ ``$env:TAG`` のソースからビルドしたものです（コード署名はしていないため、初回起動時に SmartScreen の確認が出ます）。
+          "@
+          gh release create $env:TAG UsbMonitor/bin/UsbMonitor.exe UsbMonitor/bin/UsbMonitor.exe.sha256 --title $env:TAG --notes $notes --verify-tag

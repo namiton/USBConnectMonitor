@@ -21,6 +21,12 @@ USB デバイスが「認識したりしなかったりする」原因を突き�
 
 [Releases](https://github.com/namiton/USBConnectMonitor/releases) から `UsbMonitor.exe` をダウンロードして起動します。
 
+v1.0.1 以降の exe は、GitHub Actions がタグのソースからビルドしたものです（[release.yml](.github/workflows/release.yml)）。コード署名はしていないため、初回起動時に SmartScreen の確認が出ます。ダウンロードしたファイルが改ざんされていないかは、リリースに載っている SHA256 と照合して確認できます。
+
+```bash
+powershell -NoProfile -Command "(Get-FileHash .\UsbMonitor.exe -Algorithm SHA256).Hash"
+```
+
 | 画面の要素 | 内容 |
 |---|---|
 | 統計カード | 接続中の台数 / 起動してからの切断回数 / 最後に切断した時刻と機器名 |
@@ -66,6 +72,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File UsbDiag/UsbDiag.ps1 -Days 3
 | `-Days <n>` | 診断する期間（既定 14 日） |
 | `-Top <n>` | 表示するデバイス数（既定 5） |
 | `-Watch` | コンソールでリアルタイム監視（`UsbDiag_Watch.bat` と同じ） |
+
+## 安全性とプライバシー
+
+- **PC の設定は変更しません。** レジストリ・電源設定・デバイスの有効/無効などには一切触れず、イベントログとデバイス情報を読むだけです。書き込むのはツールのフォルダ内の `reports\` へのログとレポートだけです
+- **通信しません。** 管理者権限も使いません
+- **DLL は System32 からだけ読み込みます。** exe と同じフォルダに置かれた同名の DLL は読み込みません
+- **デバイス名は無害化して扱います。** デバイス名は USB 機器自身が申告する文字列のため、制御文字を取り除き、CSV では数式として解釈されないようにしています
+- **ログとレポートには接続機器のシリアル番号が含まれます。** 不具合報告などで人に共有するときは、該当部分を伏せてください
 
 ## ライセンス
 
